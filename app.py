@@ -404,8 +404,10 @@ MANUAL_BRIDGES: Dict[str, LocalHttpProxyAuthBridge] = {}
 
 def _launch_on_interactive_desktop(args: List[str]):
     """
-    Launch a GUI process (e.g. Chrome) explicitly onto the user's interactive desktop (winsta0\\default)
-    even if the backend server was started inside an isolated/background desktop session (e.g. exebox).
+    Launch a GUI process (e.g. Chrome) so it shows up on the user's desktop.
+    On Windows, hop onto winsta0\\default via CreateProcessW to escape background
+    desktops (exebox / service sessions). On Linux/macOS, Popen in a new session
+    is enough — a graphical session is required in the caller's environment.
     """
     if os.name == "nt":
         try:
@@ -468,7 +470,22 @@ def _launch_on_interactive_desktop(args: List[str]):
                 return
         except Exception:
             pass
-    subprocess.Popen(args)
+        subprocess.Popen(args)
+        return
+
+    env = os.environ.copy()
+    if not env.get("DISPLAY") and not env.get("WAYLAND_DISPLAY"):
+        append_log(
+            f"[{time.strftime('%H:%M:%S')}] [BROWSER] ⚠️ DISPLAY/WAYLAND_DISPLAY не заданы — Chrome не сможет открыть окно. "
+            "Запусти app.py из графической сессии."
+        )
+    subprocess.Popen(
+        args,
+        env=env,
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 @app.post("/api/open_browser")

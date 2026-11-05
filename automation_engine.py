@@ -5,6 +5,8 @@ import hmac
 import json
 import os
 import re
+import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -13,14 +15,37 @@ import time
 from typing import Callable, Dict, Any, Optional
 from playwright.async_api import async_playwright
 
+IS_WINDOWS = os.name == "nt"
+
+
 def _find_chrome_path() -> str:
-    candidates = [
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
-    ]
+    env_override = os.environ.get("CHROME_PATH", "").strip()
+    if env_override and os.path.exists(env_override):
+        return env_override
+
+    if IS_WINDOWS:
+        candidates = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+        ]
+    else:
+        candidates = [
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/google-chrome",
+            "/opt/google/chrome/chrome",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/snap/bin/chromium",
+            "/var/lib/flatpak/exports/bin/com.google.Chrome",
+        ]
+        for name in ("google-chrome-stable", "google-chrome", "chromium", "chromium-browser"):
+            resolved = shutil.which(name)
+            if resolved:
+                candidates.insert(0, resolved)
+
     for p in candidates:
-        if os.path.exists(p):
+        if p and os.path.exists(p):
             return p
     return candidates[0]
 
@@ -1742,11 +1767,45 @@ class GoogleUltraAutomator:
 
         # Cleanly kill any lingering process listening on self.port
         try:
-            net_out = subprocess.check_output(f"netstat -ano | findstr :{self.port}", shell=True).decode("gbk", errors="ignore")
-            for line in net_out.splitlines():
-                if "LISTENING" in line:
-                    old_pid = line.strip().split()[-1]
-                    subprocess.run(f"taskkill /F /T /PID {old_pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if IS_WINDOWS:
+                net_out = subprocess.check_output(
+                    f"netstat -ano | findstr :{self.port}", shell=True
+                ).decode("gbk", errors="ignore")
+                for line in net_out.splitlines():
+                    if "LISTENING" in line:
+                        old_pid = line.strip().split()[-1]
+                        subprocess.run(
+                            f"taskkill /F /T /PID {old_pid}",
+                            shell=True,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+            else:
+                probe = subprocess.run(
+                    ["lsof", "-t", "-iTCP:%d" % self.port, "-sTCP:LISTEN"],
+                    capture_output=True,
+                    text=True,
+                )
+                for pid_str in probe.stdout.split():
+                    try:
+                        old_pid = int(pid_str.strip())
+                    except ValueError:
+                        continue
+                    try:
+                        os.kill(old_pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        continue
+                    for _ in range(10):
+                        try:
+                            os.kill(old_pid, 0)
+                        except ProcessLookupError:
+                            break
+                        time.sleep(0.2)
+                    else:
+                        try:
+                            os.kill(old_pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
         except Exception:
             pass
         await asyncio.sleep(0.8)
@@ -1789,6 +1848,21 @@ class GoogleUltraAutomator:
                 await self.proxy_bridge.stop()
             if self.proc:
                 try:
-                    subprocess.run(f"taskkill /F /T /PID {self.proc.pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    if IS_WINDOWS:
+                        subprocess.run(
+                            f"taskkill /F /T /PID {self.proc.pid}",
+                            shell=True,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                    else:
+                        try:
+                            self.proc.terminate()
+                            try:
+                                self.proc.wait(timeout=2.0)
+                            except subprocess.TimeoutExpired:
+                                self.proc.kill()
+                        except ProcessLookupError:
+                            pass
                 except Exception:
                     pass
